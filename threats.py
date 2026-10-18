@@ -1,10 +1,10 @@
 """საფრთხეების ბაზა: საჯარო ფიშინგ-ფიდები, მეხსიერებაში.
-
+ 
 ფიდებს (OpenPhish, Phishing.Database, არჩევითად URLhaus) GitHub-იდან/წყაროდან ვტვირთავთ
 აპის გაშვებისას და მერე ყოველ რამდენიმე საათში. ბმულებს ჰეშებად ვინახავთ RAM-ში
 (100 000 ბმული დაახლოებით 10 MB-ია), ამიტომ ბაზა ან გარე სერვისი არ გვჭირდება.
 /api/check-ში ბმულს ამ სიებს ვადარებთ.
-
+ 
 გარემოს ცვლადები (ყველა არჩევითია):
   ADMIN_TOKEN         /api/admin/* ბილიკებისთვის
   URLHAUS_AUTH_KEY    abuse.ch-ის უფასო გასაღები, URLhaus-ის ჩასართავად
@@ -20,21 +20,25 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
-
+ 
 import httpx
-
+ 
 log = logging.getLogger("safelink.threats")
-
+ 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 URLHAUS_KEY = os.getenv("URLHAUS_AUTH_KEY", "").strip()
 REFRESH_HOURS = float(os.getenv("FEED_REFRESH_HOURS", "6"))
-MAX_PER_FEED = int(os.getenv("MAX_PER_FEED", "100000"))
+MAX_PER_FEED = int(os.getenv("MAX_PER_FEED", "300000"))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-
+ 
 OPENPHISH_URL = "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt"
-PHISHDB_URL = "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/phishing-links-ACTIVE-NOW.txt"
-
+# ACTIVE-NOW ფაილი ხშირად ცარიელია, ამიტომ სრულ სიას ვიყენებთ; თუ ვერ ჩამოვიდა, დომენების სიას
+PHISHDB_URLS = [
+    "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/phishing-links-ACTIVE.txt",
+    "https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/phishing-domains-ACTIVE.txt",
+]
+ 
 # საერთო პლატფორმები: მათზე მხოლოდ ზუსტი ბმულის დამთხვევა ითვლება, მისამართისა არა,
 # თორემ ერთი ცუდი გვერდი მთელ docs.google.com-ს "გააფუჭებდა".
 SHARED_HOSTS = {
@@ -47,7 +51,7 @@ SHARED_HOSTS = {
     "github.io", "herokuapp.com", "ipfs.io", "sharepoint.com", "typeform.com", "airtable.com",
     "jotform.com", "linktr.ee", "instagram.com", "x.com", "twitter.com",
 }
-
+ 
 # სახელი -> {"urls": set[int], "hosts": set[str], "count": int, "updated": datetime}
 _state: dict[str, dict] = {}
 _feed: httpx.AsyncClient | None = None
@@ -55,17 +59,17 @@ _db: httpx.AsyncClient | None = None      # Supabase, მხოლოდ მო�
 _task: asyncio.Task | None = None
 _manual: asyncio.Task | None = None
 _lock = asyncio.Lock()
-
+ 
 _HOST_OK = re.compile(r"^[a-z0-9.-]{1,253}$")
-
-
+ 
+ 
 def _err(e: Exception) -> str:
     """ლოგში URL არ გავიტანოთ (URLhaus-ის გასაღები URL-შია)."""
     if isinstance(e, httpx.HTTPStatusError):
         return f"HTTP {e.response.status_code}"
     return type(e).__name__
-
-
+ 
+ 
 # ---------------------------------------------------------------- ნორმალიზაცია
 def key_of(raw: str) -> tuple[str, int] | None:
     """ბმულიდან (host, ჰეში). სქემა, www, #ფრაგმენტი და ბოლო / არ ითვლება."""
@@ -90,16 +94,16 @@ def key_of(raw: str) -> tuple[str, int] | None:
         return None
     k = host + p.path.rstrip("/") + ("?" + p.query if p.query else "")
     return host, int.from_bytes(hashlib.sha1(k.encode()).digest()[:8], "big")
-
-
+ 
+ 
 # ---------------------------------------------------------------- ფიდების პარსერები
 async def _plain(lines):
     async for line in lines:
         line = line.strip()
         if line and not line.startswith("#"):
             yield line
-
-
+ 
+ 
 async def _urlhaus(lines):
     cols = None
     async for line in lines:
@@ -117,15 +121,16 @@ async def _urlhaus(lines):
                 yield d["url"]
         elif len(row) > 2:
             yield row[2]
-
-
-def _feeds() -> list[tuple[str, str, object]]:
-    feeds = [("openphish", OPENPHISH_URL, _plain), ("phishing.database", PHISHDB_URL, _plain)]
+ 
+ 
+def _feeds() -> list[tuple[str, list[str], object]]:
+    """(სახელი, [მისამართები რიგით: პირველი რომელიც იმუშავებს], პარსერი)"""
+    feeds = [("openphish", [OPENPHISH_URL], _plain), ("phishing.database", PHISHDB_URLS, _plain)]
     if URLHAUS_KEY:
-        feeds.append(("urlhaus", f"https://urlhaus-api.abuse.ch/v2/files/exports/{URLHAUS_KEY}/recent.csv", _urlhaus))
+        feeds.append(("urlhaus", [f"https://urlhaus-api.abuse.ch/v2/files/exports/{URLHAUS_KEY}/recent.csv"], _urlhaus))
     return feeds
-
-
+ 
+ 
 # ---------------------------------------------------------------- ჩატვირთვა
 async def _ingest(name: str, url: str, parser) -> int:
     urls: set[int] = set()
@@ -148,24 +153,27 @@ async def _ingest(name: str, url: str, parser) -> int:
         raise RuntimeError("ფიდი ცარიელია")  # ძველ მონაცემებს არ ვკარგავთ
     _state[name] = {"urls": urls, "hosts": hosts, "count": len(urls), "updated": datetime.now(timezone.utc)}
     return len(urls)
-
-
+ 
+ 
 async def refresh(force: bool = False) -> None:
     if _feed is None:
         return
     async with _lock:
         now = datetime.now(timezone.utc)
-        for name, url, parser in _feeds():
+        for name, urls, parser in _feeds():
             s = _state.get(name)
             if not force and s and now - s["updated"] < timedelta(hours=REFRESH_HOURS):
                 continue
-            try:
-                n = await _ingest(name, url, parser)
-                log.info("ფიდი %s განახლდა: %d ბმული", name, n)
-            except Exception as e:
-                log.warning("ფიდი %s ვერ განახლდა: %s", name, _err(e))
-
-
+            for i, url in enumerate(urls, 1):
+                try:
+                    n = await _ingest(name, url, parser)
+                    log.info("ფიდი %s განახლდა: %d ბმული (წყარო %d/%d)", name, n, i, len(urls))
+                    break
+                except Exception as e:
+                    reason = "ცარიელია" if isinstance(e, RuntimeError) else _err(e)
+                    log.warning("ფიდი %s, წყარო %d/%d ვერ განახლდა: %s", name, i, len(urls), reason)
+ 
+ 
 async def _loop() -> None:
     await asyncio.sleep(3)
     while True:
@@ -174,22 +182,22 @@ async def _loop() -> None:
         except Exception as e:  # ციკლი არ უნდა გაჩერდეს
             log.warning("განახლების ციკლი: %s", _err(e))
         await asyncio.sleep(3600)
-
-
+ 
+ 
 def trigger_refresh() -> None:
     global _manual
     _manual = asyncio.create_task(refresh(force=True))
-
-
+ 
+ 
 def status() -> dict:
     return {n: {"count": s["count"], "updated_at": s["updated"].isoformat(timespec="seconds")}
             for n, s in _state.items()}
-
-
+ 
+ 
 def total() -> int:
     return sum(s["count"] for s in _state.values())
-
-
+ 
+ 
 async def start() -> None:
     global _feed, _db, _task
     _feed = httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": "SafeLink/1.0"},
@@ -197,8 +205,8 @@ async def start() -> None:
     if reports_enabled():
         _db = httpx.AsyncClient(base_url=SUPABASE_URL + "/rest/v1", timeout=10)
     _task = asyncio.create_task(_loop())
-
-
+ 
+ 
 async def stop() -> None:
     for t in (_task, _manual):
         if t:
@@ -206,8 +214,8 @@ async def stop() -> None:
     for c in (_feed, _db):
         if c:
             await c.aclose()
-
-
+ 
+ 
 # ---------------------------------------------------------------- ძებნა
 async def lookup(raw: str) -> dict | None:
     """აბრუნებს {"match": "url"|"host", "sources": [...]} ან None."""
@@ -223,13 +231,13 @@ async def lookup(raw: str) -> dict | None:
         if by_host:
             return {"match": "host", "sources": by_host}
     return None
-
-
+ 
+ 
 # ---------------------------------------------------------------- მონიშვნები (არჩევითი Supabase)
 def reports_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
-
-
+ 
+ 
 async def save_report(hosts: list[str], text_hash: str) -> bool:
     if _db is None or not hosts:
         return False
@@ -242,3 +250,5 @@ async def save_report(hosts: list[str], text_hash: str) -> bool:
         return r.status_code in (200, 201, 204)
     except Exception:
         return False
+ 
+
