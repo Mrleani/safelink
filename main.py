@@ -12,16 +12,20 @@ GET  /api/health
 """
 import asyncio
 import hashlib
+import hmac
 import ipaddress
+import logging
 import os
 import re
 import sqlite3
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import threats
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -49,9 +53,20 @@ URL_RE = re.compile(
 )
 TWO_PART = {"com.ge", "org.ge", "net.ge"}
 HOMOGLYPHS = str.maketrans({"0": "o", "1": "l", "3": "e", "5": "s", "$": "s"})
+SOURCE_NAMES = {"openphish": "OpenPhish", "phishing.database": "Phishing.Database", "urlhaus": "URLhaus"}
+logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------- app
-app = FastAPI(title="SafeLink API", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await threats.start()
+    try:
+        yield
+    finally:
+        await threats.stop()
+
+
+app = FastAPI(title="SafeLink API", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -287,7 +302,18 @@ async def analyze(text: str) -> dict:
                 reasons.append(r("warn", "რეალური მისამართი ვერ დავადგინეთ", "ბმული არ იხსნება ან დაცულია."))
 
         # გარე შემოწმებები (პარალელურად)
-        age, gsb = await asyncio.gather(domain_age_days(reg), safe_browsing_hit(final_url))
+        age, gsb, th1, th2 = await asyncio.gather(
+            domain_age_days(reg), safe_browsing_hit(final_url),
+            threats.lookup(raw), threats.lookup(final_url) if final_url != raw else asyncio.sleep(0))
+        th = th1 or th2
+        if th:
+            names = ", ".join(SOURCE_NAMES.get(s, s) for s in th["sources"])
+            if th["match"] == "url":
+                score += 80
+                reasons.append(r("bad", "ცნობილი თაღლითური ბმულია", f"ზუსტად ეს ბმული ფიშინგის ბაზაშია ({names})."))
+            else:
+                score += 60
+                reasons.append(r("bad", "მისამართი ფიშინგის ბაზაშია", f"ამ მისამართზე თაღლითური გვერდი ფიქსირდება ({names})."))
         if age is not None:
             if age < 30:
                 score += 30
@@ -326,7 +352,27 @@ async def analyze(text: str) -> dict:
 # ---------------------------------------------------------------- routes
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "safe_browsing": bool(GSB_API_KEY)}
+    return {"ok": True, "safe_browsing": bool(GSB_API_KEY), "threat_db": threats.total() > 0, "threats": threats.total()}
+
+
+def _admin_ok(request: Request) -> bool:
+    tok = request.headers.get("x-admin-token", "")
+    return bool(threats.ADMIN_TOKEN) and hmac.compare_digest(tok, threats.ADMIN_TOKEN)
+
+
+@app.get("/api/admin/status")
+async def admin_status(request: Request):
+    if not _admin_ok(request):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    return {"feeds": threats.status(), "reports_db": threats.reports_enabled()}
+
+
+@app.post("/api/admin/refresh")
+async def admin_refresh(request: Request):
+    if not _admin_ok(request):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    threats.trigger_refresh()
+    return {"started": True}
 
 
 @app.post("/api/check")
@@ -353,6 +399,9 @@ async def report(body: In):
     # კონფიდენციალობა: სრულ ტექსტს არ ვინახავთ, მხოლოდ დომენებს და ჰეშს
     hosts = {registrable(h) for h, _ in (parse_host(m.group(0)) for m in URL_RE.finditer(body.text)) if h}
     digest = hashlib.sha256(body.text.strip().lower().encode()).hexdigest()[:16]
+    if threats.reports_enabled():
+        await threats.save_report(sorted(hosts), digest)
+        return {"ok": True}
     try:
         await asyncio.to_thread(_save_report, ",".join(sorted(hosts))[:300], digest)
     except Exception:
@@ -367,3 +416,4 @@ elif os.path.isfile("index.html"):
     @app.get("/")
     async def index():
         return FileResponse("index.html")
+
